@@ -1,0 +1,160 @@
+import os
+import math
+import time
+import requests
+import pandas as pd
+from requests.adapters import HTTPAdapter, Retry
+
+# -----------------------------
+# CONFIG — EDIT THESE
+# -----------------------------
+
+SN_INSTANCE = "dev181336"  # from your URL: https://dev181336.service-now.com
+TABLE = "x_1854014_incide_0_incidents"  # your scoped table
+DISPLAY_VALUE = "all"  # "true" | "false" | "all"
+BATCH_SIZE = 1000       # 100–1000 is safe
+TIMEOUT = 60            # seconds
+OUTPUT_CSV = "snow_incidents_intake.csv"
+OUTPUT_XLSX = "snow_incidents.xlsx"
+WORKSHEET_NAME = "Incidents"
+
+# AUTH — prefer environment variables:
+#   set SN_USER / SN_PASS or SN_PAT in your environment.
+AUTH_MODE = os.getenv("SN_AUTH_MODE", "BASIC")  # BASIC or PAT
+SN_USER = os.getenv("SN_USER", "admin")
+SN_PASS = os.getenv("SN_PASS", "pwd")
+SN_PAT  = os.getenv("SN_PAT")  # if using PAT, set SN_AUTH_MODE=PAT
+
+# Choose fields that match your Intake/Working schemas
+FIELDS = [
+    "number", "sys_created_on",
+    "caller_id", "caller_id.email", "caller_id.name",
+    "short_description", "description",
+    "category", "subcategory",
+    "cmdb_ci",
+    "impact", "urgency", "priority",
+    "state",
+    "assignment_group", "assigned_to",
+    "sys_updated_on", "resolved_at", "closed_at"
+]
+
+# Optional: filter (encoded query). Example: last 30 days and not canceled (state!=7)
+# Learn more: https://docs.servicenow.com/bundle/utah-platform-user-interface/page/use/common-ui-elements/reference/r_OpAvailableFiltersQueries.html
+SYS_PARMS_QUERY = ""  # e.g. "sys_created_onRELATIVEGT@dayofweek@ago@30^state!=7"
+
+# -----------------------------
+# HTTP session with retries
+# -----------------------------
+session = requests.Session()
+retries = Retry(
+    total=5, backoff_factor=1.2,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"]
+)
+session.mount("https://", HTTPAdapter(max_retries=retries))
+
+if AUTH_MODE.upper() == "BASIC":
+    session.auth = (SN_USER, SN_PASS)
+elif AUTH_MODE.upper() == "PAT":
+    session.headers.update({"Authorization": f"Bearer {SN_PAT}"})
+else:
+    raise ValueError("SN_AUTH_MODE must be BASIC or PAT")
+
+session.headers.update({
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+})
+
+BASE = f"https://{SN_INSTANCE}.service-now.com"
+TABLE_URL = f"{BASE}/api/now/table/{TABLE}"
+STATS_URL = f"{BASE}/api/now/stats/{TABLE}"
+
+def get_count():
+    params = {"sysparm_count": "true"}
+    if SYS_PARMS_QUERY:
+        params["sysparm_query"] = SYS_PARMS_QUERY
+    r = session.get(STATS_URL, params=params, timeout=TIMEOUT)
+    r.raise_for_status()
+    return int(r.json()["result"]["stats"]["count"])
+
+def fetch_page(offset: int, limit: int):
+    params = {
+        "sysparm_display_value": DISPLAY_VALUE,
+        "sysparm_exclude_reference_link": "true",
+        "sysparm_limit": limit,
+        "sysparm_offset": offset,
+    }
+    if FIELDS:
+        params["sysparm_fields"] = ",".join(FIELDS)
+    if SYS_PARMS_QUERY:
+        params["sysparm_query"] = SYS_PARMS_QUERY
+
+    r = session.get(TABLE_URL, params=params, timeout=TIMEOUT)
+    if r.status_code != 200:
+        # Try to print ServiceNow error if present
+        try:
+            print("Error:", r.status_code, r.json())
+        except Exception:
+            print("Error:", r.status_code, r.text[:500])
+        r.raise_for_status()
+    return r.json().get("result", [])
+
+def main():
+    total = get_count()
+    print(f"Total rows to fetch: {total}")
+
+    pages = math.ceil(total / BATCH_SIZE) if total > 0 else 0
+    all_rows = []
+
+    for i in range(pages):
+        offset = i * BATCH_SIZE
+        page = fetch_page(offset, BATCH_SIZE)
+        all_rows.extend(page)
+        print(f"Fetched {len(page)} rows (offset {offset})")
+        # Gentle pacing if large
+        time.sleep(0.2)
+
+    if not all_rows:
+        print("No data returned.")
+        return
+
+    # Normalize JSON
+    df = pd.json_normalize(all_rows)
+
+    # Prefer display_value columns where available
+    rename_map = {
+        "number": "Incident Number",
+        "sys_created_on": "Reported Date",
+        "caller_id.display_value": "Client Name",
+        "caller_id.email": "Reported By (Email)",
+        "caller_id.name": "Reported By (Name)",
+        "short_description": "Short Description",
+        "description": "Detailed Description",
+        "category": "Category",
+        "subcategory": "Subcategory",
+        "cmdb_ci.display_value": "Configuration Item",
+        "impact": "Impact",
+        "urgency": "Urgency",
+        "priority": "Priority",
+        "state": "Status",
+        "assignment_group.display_value": "Assigned Group",
+        "assigned_to.display_value": "Assigned To",
+        "sys_updated_on": "Updated On",
+        "resolved_at": "Resolved Date/Time",
+        "closed_at": "Closed Date/Time"
+    }
+
+    # Apply friendly names only if columns exist
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    # Write CSV for Smartsheet Intake (best for Control Center + Data Uploader)
+    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8")
+    print(f"Wrote CSV: {OUTPUT_CSV} ({len(df)} rows)")
+
+    # Write XLSX for analysis or ad-hoc sharing
+    with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=WORKSHEET_NAME, index=False)
+    print(f"Wrote Excel: {OUTPUT_XLSX} / {WORKSHEET_NAME}")
+
+if __name__ == "__main__":
+    main()
