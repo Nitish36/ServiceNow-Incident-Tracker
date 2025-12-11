@@ -60,25 +60,32 @@ def normalize_date(value: str) -> Optional[str]:
 # ---------------------------------------------------------
 # 1) Fetch Latest ServiceNow Record
 # ---------------------------------------------------------
-def get_latest_servicenow_record():
-    resp = requests.get(SERVICENOW_URL, auth=(SERVICENOW_USER, SERVICENOW_PWD))
+def fetch_latest_servicenow_record():
+    url = f"{SERVICENOW_INSTANCE}/api/now/table/{SERVICENOW_TABLE}"
+    
+    # Get more rows so sorting makes sense
+    params = {
+        "sysparm_limit": 50,             # Pull enough rows
+        "sysparm_display_value": "true"  # So client_name is readable
+    }
+
+    resp = requests.get(url, auth=(SERVICENOW_USER, SERVICENOW_PWD), params=params)
     resp.raise_for_status()
 
-    data = resp.json().get("result", [])
-    if not data:
-        raise RuntimeError("No ServiceNow data found.")
+    result = resp.json().get("result", [])
+    if not result:
+        raise Exception("No records returned from ServiceNow")
 
-    def get_dt(r):
-        dv = dotted_get(r, "issue_raised_date.display_value")
-        if dv:
-            try:
-                return datetime.strptime(dv[:19], "%Y-%m-%d %H:%M:%S")
-            except:
-                return None
-        return None
+    # Sort by Client Name descending
+    sorted_records = sorted(
+        result,
+        key=lambda x: (x.get("client_name") or "").lower(),
+        reverse=True
+    )
 
-    sorted_data = sorted(data, key=lambda x: get_dt(x) or datetime.min)
-    return sorted_data[-1]
+    # Take the first after sorting
+    latest = sorted_records[0]
+    return latest
 
 
 # ---------------------------------------------------------
