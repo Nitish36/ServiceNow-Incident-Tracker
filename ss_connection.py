@@ -13,13 +13,15 @@ SERVICENOW_PWD = os.getenv("SN_TOKEN")
 
 SHEET_ID = 8815098509348740
 
-SERVICENOW_USER = "admin"   # If needed, you can make this a secret too
+SERVICENOW_USER = "admin"   # Make this a secret if you prefer
 SERVICENOW_URL = (
     "https://dev181336.service-now.com/api/now/table/x_1854014_incide_0_incidents"
-    "?sysparm_display_value=all"
+    # removed sysparm_display_value here because we control it via params
 )
 
 # Initialize Smartsheet client
+if not SMARTSHEET_TOKEN:
+    raise RuntimeError("Missing SMARTSHEET_TOKEN (SS_TOKEN) environment variable.")
 smartsheet_client = smartsheet.Smartsheet(SMARTSHEET_TOKEN)
 smartsheet_client.errors_as_exceptions(True)
 
@@ -35,6 +37,27 @@ def dotted_get(obj: Dict[str, Any], dotted_key: str) -> Any:
         else:
             return None
     return cur
+
+
+def extract_display_string(value: Any) -> str:
+    """
+    Given a ServiceNow field value that may be a dict like {'display_value': 'X'},
+    or a raw string, return a safe string (or empty string).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for k in ("display_value", "value", "text", "name", "label"):
+            v = value.get(k)
+            if v not in (None, ""):
+                return str(v)
+    # fallback to str of value
+    try:
+        return str(value)
+    except Exception:
+        return ""
 
 
 def normalize_date(value: str) -> Optional[str]:
@@ -58,15 +81,15 @@ def normalize_date(value: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------
-# 1) Fetch Latest ServiceNow Record
+# 1) Fetch Latest ServiceNow Record (sorted by client_name desc)
 # ---------------------------------------------------------
 def fetch_latest_servicenow_record():
     url = f"{SERVICENOW_URL}"
     
-    # Get more rows so sorting makes sense
+    # Pull a batch so sorting works. Increase sysparm_limit if you expect more rows.
     params = {
-        "sysparm_limit": 50,             # Pull enough rows
-        "sysparm_display_value": "true"  # So client_name is readable
+        "sysparm_limit": 200,
+        "sysparm_display_value": "true"  # so display_value fields are present
     }
 
     resp = requests.get(url, auth=(SERVICENOW_USER, SERVICENOW_PWD), params=params)
@@ -76,14 +99,19 @@ def fetch_latest_servicenow_record():
     if not result:
         raise Exception("No records returned from ServiceNow")
 
-    # Sort by Client Name descending
-    sorted_records = sorted(
-        result,
-        key=lambda x: (x.get("client_name") or "").lower(),
-        reverse=True
-    )
+    # helper to get client_name as a normalized string (for sorting)
+    def client_name_key(rec):
+        # Prefer display_value path if available
+        name_val = dotted_get(rec, "client_name.display_value")
+        if name_val is None:
+            # fallback to raw client_name field
+            name_val = rec.get("client_name")
+        # normalize whatever we have to a string
+        name_str = extract_display_string(name_val)
+        return name_str.lower()  # case-insensitive
 
-    # Take the first after sorting
+    # Sort by Client Name descending and pick first
+    sorted_records = sorted(result, key=client_name_key, reverse=True)
     latest = sorted_records[0]
     return latest
 
@@ -115,17 +143,28 @@ def build_row(latest_record):
         if not col_id:
             continue
 
-        val = dotted_get(latest_record, sn_key)
+        raw_val = dotted_get(latest_record, sn_key)
+        # if dotted_get returned None, maybe the field is directly present (fallback)
+        if raw_val is None:
+            raw_val = latest_record.get(sn_key.split(".")[0])  # try base key
 
+        # Convert to appropriate types / formats
         if sm_col_title == "Requested Date":
-            val = normalize_date(val)
-
-        if sm_col_title == "Project Created":
-            if str(val).lower() in ("true", "1", "yes"):
+            # raw_val might be a string or dict; extract string then normalize
+            raw_str = extract_display_string(raw_val)
+            val = normalize_date(raw_str)
+        elif sm_col_title == "Project Created":
+            val_str = extract_display_string(raw_val).lower()
+            if val_str in ("true", "1", "yes"):
                 val = True
-            elif str(val).lower() in ("false", "0", "no"):
+            elif val_str in ("false", "0", "no"):
                 val = False
+            else:
+                val = False if raw_val in (None, "", False) else True
+        else:
+            val = extract_display_string(raw_val)
 
+        # Avoid None — SDK prefers actual value types
         if val is None:
             val = ""
 
@@ -136,13 +175,17 @@ def build_row(latest_record):
             })
         )
 
-    # Guarantee primary column
+    # Guarantee primary column (Client Name) has a visible value
     client_name_col_id = col_map.get("Client Name")
     if client_name_col_id and not any(c.column_id == client_name_col_id for c in cells):
+        # try to extract from record
+        client_name_val = extract_display_string(dotted_get(latest_record, "client_name.display_value") or latest_record.get("client_name"))
+        if not client_name_val:
+            client_name_val = "Unknown Client"
         cells.append(
             smartsheet.models.Cell({
                 "column_id": client_name_col_id,
-                "value": "Unknown Client"
+                "value": client_name_val
             })
         )
 
