@@ -1,0 +1,30 @@
+name: Push ServiceNow Data to Smartsheet
+
+on:
+  workflow_dispatch:   # Manual run
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes (optional)
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+
+    - name: Install dependencies
+      run: |
+        pip install smartsheet-python-sdk requests
+
+    - name: Run Smartsheet sync script
+      env:
+        SS_TOKEN: ${{ secrets.SS_TOKEN }}
+        SN_TOKEN: ${{ secrets.SN_TOKEN }}
+      run: |
+        python ss_connection.py
