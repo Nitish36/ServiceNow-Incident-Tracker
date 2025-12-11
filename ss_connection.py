@@ -61,7 +61,7 @@ def normalize_date(value: str) -> Optional[str]:
 # 1) Fetch Latest ServiceNow Record
 # ---------------------------------------------------------
 def fetch_latest_servicenow_record():
-    url = f"{SERVICENOW_INSTANCE}/api/now/table/{SERVICENOW_TABLE}"
+    url = f"{SERVICENOW_URL}"
     
     # Get more rows so sorting makes sense
     params = {
