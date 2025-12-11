@@ -156,7 +156,7 @@ def build_row(latest_record):
 # MAIN
 # ---------------------------------------------------------
 def main():
-    latest = get_latest_servicenow_record()
+    latest = fetch_latest_servicenow_record()
     row = build_row(latest)
 
     resp = smartsheet_client.Sheets.add_rows(SHEET_ID, [row])
